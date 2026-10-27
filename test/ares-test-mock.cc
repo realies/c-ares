@@ -166,14 +166,28 @@ TEST_P(NoDNS0x20MockTest, Basic) {
   EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
 }
 
+/* Saturate query IDs without filling the mock server's UDP receive queue. */
+static ares_ssize_t QueryIdExhaustionSendv(ares_socket_t       sock,
+                                           const struct iovec *vec, int len,
+                                           void *data)
+{
+  if (data != nullptr && *static_cast<bool *>(data)) {
+    *static_cast<bool *>(data) = false;
+    LibraryTest::SetFailSend();
+    return LibraryTest::ares_sendv_fail(sock, vec, len, nullptr);
+  }
+  return static_cast<ares_ssize_t>(vec[0].iov_len);
+}
+
 TEST_P(MockUDPChannelTest, QueryIdExhaustion)
 {
   const size_t             max_queries = 65536;
   std::vector<QueryResult> pending(max_queries);
+  ares_socket_functions    sock_funcs = {};
+  sock_funcs.asendv                   = QueryIdExhaustionSendv;
+  ares_set_socket_functions(channel_, &sock_funcs, nullptr);
 
-  EXPECT_CALL(server_, OnRequest("pending.example", T_A))
-    .Times(testing::AnyNumber())
-    .WillRepeatedly(SetReplyData(&server_, std::vector<byte>()));
+  EXPECT_CALL(server_, OnRequest("pending.example", T_A)).Times(0);
 
   /* Leave the event loop idle so all queries remain outstanding. */
   for (size_t i = 0; i < max_queries; i++) {
@@ -195,6 +209,7 @@ TEST_P(MockUDPChannelTest, QueryIdExhaustion)
   EXPECT_EQ(max_queries, ares_queue_active_queries(channel_));
 
   ares_cancel(channel_);
+  ares_set_socket_functions(channel_, nullptr, nullptr);
   EXPECT_EQ(0, ares_queue_active_queries(channel_));
   for (size_t i = 0; i < max_queries; i++) {
     EXPECT_TRUE(pending[i].done_);
@@ -5668,14 +5683,13 @@ TEST_P(ServerRecoveryMultiMockTest, ProbeAfterQueryIdExhaustion)
 
   const size_t             max_queries = 65536;
   std::vector<QueryResult> pending(max_queries);
+  bool                     fail_send  = false;
   ares_socket_functions    sock_funcs = {};
-  sock_funcs.asendv                   = ares_sendv_fail;
-  ares_set_socket_functions(channel_, &sock_funcs, nullptr);
+  sock_funcs.asendv                   = QueryIdExhaustionSendv;
+  ares_set_socket_functions(channel_, &sock_funcs, &fail_send);
 
   for (size_t i = 0; i < 2; i++) {
-    EXPECT_CALL(*servers_[i], OnRequest("pending.example", T_A))
-      .Times(testing::AnyNumber())
-      .WillRepeatedly(SetReplyData(servers_[i].get(), std::vector<byte>()));
+    EXPECT_CALL(*servers_[i], OnRequest("pending.example", T_A)).Times(0);
   }
 
   /* Fill while all servers are healthy so no earlier probe can be pending. */
@@ -5688,11 +5702,12 @@ TEST_P(ServerRecoveryMultiMockTest, ProbeAfterQueryIdExhaustion)
 
   /* Fail #0 and requeue onto #1 without running the event loop or timeouts.
    * Retries do not probe, leaving one query ID free. */
-  SetFailSend();
+  fail_send = true;
   EXPECT_EQ(ARES_SUCCESS,
             ares_query_dnsrec(channel_, "pending.example", ARES_CLASS_IN,
                               ARES_REC_TYPE_A, QueryCallback,
                               &pending[max_queries - 2], nullptr));
+  EXPECT_FALSE(fail_send);
   EXPECT_EQ(max_queries - 1, ares_queue_active_queries(channel_));
   ares_sleep_time(SERVER_FAILOVER_RETRY_DELAY +
                   (SERVER_FAILOVER_RETRY_DELAY / 10));
@@ -5705,35 +5720,12 @@ TEST_P(ServerRecoveryMultiMockTest, ProbeAfterQueryIdExhaustion)
   EXPECT_EQ(max_queries, ares_queue_active_queries(channel_));
 
   ares_cancel(channel_);
+  ares_set_socket_functions(channel_, nullptr, nullptr);
   EXPECT_EQ(0, ares_queue_active_queries(channel_));
   for (size_t i = 0; i < max_queries; i++) {
     EXPECT_TRUE(pending[i].done_);
     EXPECT_EQ(ARES_ECANCELLED, pending[i].status_);
   }
-
-  /* Drain the bulk UDP traffic before expecting a probe reply.  This query
-   * also starts a new, unanswered probe now that IDs are available again. */
-  DNSPacket drain_reply;
-  drain_reply.set_response()
-    .set_aa()
-    .add_question(new DNSQuestion("drain.example", T_A))
-    .add_answer(new DNSARR("drain.example", 100, { 1, 2, 3, 4 }));
-  EXPECT_CALL(*servers_[1], OnRequest("drain.example", T_A))
-    .Times(testing::AtLeast(1))
-    .WillRepeatedly(SetReply(servers_[1].get(), &drain_reply));
-  EXPECT_CALL(*servers_[0], OnRequest("drain.example", T_A))
-    .Times(testing::AnyNumber())
-    .WillRepeatedly(SetReplyData(servers_[0].get(), std::vector<byte>()));
-  QueryResult drained;
-  EXPECT_EQ(ARES_SUCCESS, ares_query_dnsrec(channel_, "drain.example",
-                                            ARES_CLASS_IN, ARES_REC_TYPE_A,
-                                            QueryCallback, &drained, nullptr));
-  EXPECT_EQ(2, ares_queue_active_queries(channel_));
-  Process();
-  EXPECT_TRUE(drained.done_);
-  EXPECT_EQ(ARES_SUCCESS, drained.status_);
-  ares_sleep_time(SERVER_FAILOVER_RETRY_DELAY +
-                  (SERVER_FAILOVER_RETRY_DELAY / 10));
 
   DNSPacket reply;
   reply.set_response()
@@ -5756,7 +5748,6 @@ TEST_P(ServerRecoveryMultiMockTest, ProbeAfterQueryIdExhaustion)
   Process();
   EXPECT_TRUE(recovered.done_);
   EXPECT_EQ(ARES_SUCCESS, recovered.status_);
-  ares_set_socket_functions(channel_, nullptr, nullptr);
 }
 
 // Test that when every server has failures, a query sent to a failed server
