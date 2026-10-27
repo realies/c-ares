@@ -207,7 +207,8 @@ TEST_P(MockUDPChannelTest, QueryIdExhaustion)
     .add_question(new DNSQuestion("recovered.example", T_A))
     .add_answer(new DNSARR("recovered.example", 100, { 1, 2, 3, 4 }));
   EXPECT_CALL(server_, OnRequest("recovered.example", T_A))
-    .WillOnce(SetReply(&server_, &reply));
+    .Times(testing::AtLeast(1))
+    .WillRepeatedly(SetReply(&server_, &reply));
 
   QueryResult recovered;
   EXPECT_EQ(ARES_SUCCESS,
@@ -5718,7 +5719,8 @@ TEST_P(ServerRecoveryMultiMockTest, ProbeAfterQueryIdExhaustion)
     .add_question(new DNSQuestion("drain.example", T_A))
     .add_answer(new DNSARR("drain.example", 100, { 1, 2, 3, 4 }));
   EXPECT_CALL(*servers_[1], OnRequest("drain.example", T_A))
-    .WillOnce(SetReply(servers_[1].get(), &drain_reply));
+    .Times(testing::AtLeast(1))
+    .WillRepeatedly(SetReply(servers_[1].get(), &drain_reply));
   EXPECT_CALL(*servers_[0], OnRequest("drain.example", T_A))
     .Times(testing::AnyNumber())
     .WillRepeatedly(SetReplyData(servers_[0].get(), std::vector<byte>()));
@@ -5739,9 +5741,11 @@ TEST_P(ServerRecoveryMultiMockTest, ProbeAfterQueryIdExhaustion)
     .add_question(new DNSQuestion("recovered.example", T_A))
     .add_answer(new DNSARR("recovered.example", 100, { 1, 2, 3, 4 }));
   EXPECT_CALL(*servers_[1], OnRequest("recovered.example", T_A))
-    .WillOnce(SetReply(servers_[1].get(), &reply));
+    .Times(testing::AtLeast(1))
+    .WillRepeatedly(SetReply(servers_[1].get(), &reply));
   EXPECT_CALL(*servers_[0], OnRequest("recovered.example", T_A))
-    .WillOnce(SetReply(servers_[0].get(), &reply));
+    .Times(testing::AtLeast(1))
+    .WillRepeatedly(SetReply(servers_[0].get(), &reply));
 
   QueryResult recovered;
   EXPECT_EQ(ARES_SUCCESS,
